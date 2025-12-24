@@ -19,9 +19,10 @@ from PySide6.QtWidgets import (
     QGraphicsDropShadowEffect, QHBoxLayout
 )
 
+import psutil
+
 from sensors_lhm import LhmReader
 from sensors_psutil import PsutilReader
-import psutil
 
 
 # -------------------------
@@ -114,144 +115,62 @@ def fmt_rate_mb_s(v: Optional[float]) -> str:
     return f"{v:.2f}MB/s"
 
 
-# -------------------------
-# Disk % Active Time reader (PDH) with fallback
-# -------------------------
-class DiskActiveReader:
+def fmt_rate_short(v: Optional[float]) -> str:
     """
-    优先：PDH 读取任务管理器同款磁盘百分比 \\PhysicalDisk(_Total)\\% Disk Time
-    回退：用 psutil.disk_io_counters() 的 IO 增量估算一个“忙碌度”百分比（不缺席）
+    简写速度（用于 DISK 超短显示）：
+      <10 => 1位小数
+      >=10 => 0位
     """
-    def __init__(self, fallback_sat_mb_s: float = 200.0, debug: bool = False):
-        self.debug = debug
-        self.fallback_sat_mb_s = float(fallback_sat_mb_s)  # IO 总吞吐达到此值视为 100%
-        self._pdh_ok = False
-        self._pdh = None
-        self._query = ctypes.c_void_p()
-        self._counter = ctypes.c_void_p()
-        self._last_err: Optional[int] = None
+    if v is None:
+        return "--"
+    if v < 10:
+        return f"{v:.1f}"
+    return f"{v:.0f}"
 
-        # fallback state
-        self._last_io = None
+
+# -------------------------
+# Disk rate reader (R/W MB/s)
+# -------------------------
+class DiskRateReader:
+    """
+    使用 psutil.disk_io_counters() 计算全盘总读/写 MB/s
+    """
+    def __init__(self):
+        self._last = None
         self._last_t = None
 
-        try:
-            self._pdh = ctypes.WinDLL("pdh.dll")
-        except Exception:
-            self._pdh = None
-
-        if not self._pdh:
-            return
-
-        self.PDH_FMT_DOUBLE = 0x00000200
-
-        class PDH_FMT_COUNTERVALUE(ctypes.Structure):
-            _fields_ = [("CStatus", ctypes.c_ulong), ("doubleValue", ctypes.c_double)]
-        self._PDH_FMT_COUNTERVALUE = PDH_FMT_COUNTERVALUE
-
-        self._PdhOpenQueryW = self._pdh.PdhOpenQueryW
-        self._PdhOpenQueryW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
-        self._PdhOpenQueryW.restype = ctypes.c_ulong
-
-        self._PdhCollectQueryData = self._pdh.PdhCollectQueryData
-        self._PdhCollectQueryData.argtypes = [ctypes.c_void_p]
-        self._PdhCollectQueryData.restype = ctypes.c_ulong
-
-        self._PdhGetFormattedCounterValue = self._pdh.PdhGetFormattedCounterValue
-        self._PdhGetFormattedCounterValue.argtypes = [
-            ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
-            ctypes.POINTER(self._PDH_FMT_COUNTERVALUE)
-        ]
-        self._PdhGetFormattedCounterValue.restype = ctypes.c_ulong
-
-        self._PdhAddEnglishCounterW = getattr(self._pdh, "PdhAddEnglishCounterW", None)
-        self._PdhAddCounterW = self._pdh.PdhAddCounterW
-        self._PdhAddCounterW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
-        self._PdhAddCounterW.restype = ctypes.c_ulong
-
-        ret = self._PdhOpenQueryW(None, None, ctypes.byref(self._query))
-        if ret != 0:
-            self._last_err = int(ret)
-            return
-
-        path = r"\\PhysicalDisk(_Total)\\% Disk Time"
-        if self._PdhAddEnglishCounterW is not None:
-            self._PdhAddEnglishCounterW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
-            self._PdhAddEnglishCounterW.restype = ctypes.c_ulong
-            ret = self._PdhAddEnglishCounterW(self._query, path, None, ctypes.byref(self._counter))
-        else:
-            ret = self._PdhAddCounterW(self._query, path, None, ctypes.byref(self._counter))
-
-        if ret != 0:
-            self._last_err = int(ret)
-            return
-
-        # prime
-        self._PdhCollectQueryData(self._query)
-        self._pdh_ok = True
-
-    def _fallback_read(self) -> Optional[float]:
+    def read(self) -> Tuple[Optional[float], Optional[float]]:
         try:
             io = psutil.disk_io_counters()
             if io is None:
-                return None
-            now = time.time()
+                return None, None
 
-            if self._last_io is None or self._last_t is None:
-                self._last_io = io
+            now = time.time()
+            if self._last is None or self._last_t is None:
+                self._last = io
                 self._last_t = now
-                return 0.0
+                return 0.0, 0.0
 
             dt = max(1e-3, now - self._last_t)
-            read_bps = (io.read_bytes - self._last_io.read_bytes) / dt
-            write_bps = (io.write_bytes - self._last_io.write_bytes) / dt
+            read_bps = (io.read_bytes - self._last.read_bytes) / dt
+            write_bps = (io.write_bytes - self._last.write_bytes) / dt
 
-            self._last_io = io
+            self._last = io
             self._last_t = now
 
-            total_mb_s = (read_bps + write_bps) / (1024 * 1024)
-            pct = (total_mb_s / max(1e-6, self.fallback_sat_mb_s)) * 100.0
-            return max(0.0, min(100.0, pct))
+            r = read_bps / (1024 * 1024)
+            w = write_bps / (1024 * 1024)
+            if r < 0:
+                r = 0.0
+            if w < 0:
+                w = 0.0
+            return r, w
         except Exception:
-            return None
-
-    def read(self) -> Optional[float]:
-        # try PDH
-        if self._pdh_ok:
-            try:
-                ret = self._PdhCollectQueryData(self._query)
-                if ret != 0:
-                    self._last_err = int(ret)
-                    if self.debug:
-                        print("PDH Collect error:", ret)
-                    return self._fallback_read()
-
-                typ = ctypes.c_ulong(0)
-                val = self._PDH_FMT_COUNTERVALUE()
-                ret = self._PdhGetFormattedCounterValue(self._counter, self.PDH_FMT_DOUBLE, ctypes.byref(typ), ctypes.byref(val))
-                if ret != 0:
-                    self._last_err = int(ret)
-                    if self.debug:
-                        print("PDH Format error:", ret)
-                    return self._fallback_read()
-
-                v = float(val.doubleValue)
-                if v < 0:
-                    v = 0.0
-                if v > 100:
-                    v = 100.0
-                return v
-            except Exception as e:
-                if self.debug:
-                    print("PDH exception:", e)
-                return self._fallback_read()
-
-        # fallback only
-        return self._fallback_read()
+            return None, None
 
 
 # -------------------------
-# Phrase buckets
+# Phrase buckets (stable by range)
 # -------------------------
 Buckets = List[Tuple[float, float, List[str]]]
 
@@ -277,12 +196,13 @@ RAM_BUCKETS: Buckets = [
     (90, 101, ["内存告急 🚨", "快溢出了 🫠", "请关闭点东西 😭"]),
 ]
 
-DISK_BUCKETS: Buckets = [
-    (0, 10,  ["磁盘在摸鱼 💤", "几乎没动静 🤫", "很清闲 🫧"]),
-    (10, 35, ["轻度读写 📄", "还算悠闲 🙂", "小忙一下 🧃"]),
-    (35, 65, ["磁盘忙起来了 ⚙️", "读写进行中 📂", "在干活 🛠️"]),
-    (65, 90, ["磁盘很忙 🧨", "IO 压力上来了 😵", "疯狂读写 💽"]),
-    (90, 101, ["磁盘爆表 🚨", "IO 拉满 🥵", "卡顿预警 ⚠️"]),
+# ✅ DISK 文案：基于 (读+写) 的 MB/s 合计分档，保持短
+DISK_IO_BUCKETS: Buckets = [
+    (0, 0.3,   ["磁盘打盹 💤", "几乎不动 🤫", "空闲摸鱼 🫧"]),
+    (0.3, 5,   ["轻轻翻页 📄", "读写小忙 🧃", "稳稳的 🙂"]),
+    (5, 30,    ["读写加速 ⚙️", "缓存热身 🔥", "开始认真 🛠️"]),
+    (30, 120,  ["磁盘起飞 🚀", "吞吐拉满 💽", "别打扰我 😵"]),
+    (120, 1e9, ["IO 爆表 🚨", "疯狂读写 ☢️", "卡顿预警 ⚠️"]),
 ]
 
 MOOD_BUCKETS: Buckets = [
@@ -377,8 +297,8 @@ class Panel(QFrame):
         self.line1 = QLabel("--")
         self.line2 = QLabel("--")
         self.line3 = QLabel("--")
-        self.line4 = QLabel("--")
-        self.line5 = QLabel("--")
+        self.line4 = QLabel("--")  # DISK
+        self.line5 = QLabel("--")  # NET
 
         for lb in (self.line1, self.line2, self.line3, self.line4, self.line5):
             lb.setObjectName("PanelLine")
@@ -494,13 +414,14 @@ class Overlay(QWidget):
 
         self.lhm = LhmReader()
         self.psr = PsutilReader()
-        self.disk_active = DiskActiveReader(fallback_sat_mb_s=200.0, debug=False)  # ✅ 不缺席
+        self.disk_rate = DiskRateReader()
         self.phrases = PhraseManager()
 
         self.last_cpu: Optional[float] = None
         self.last_gpu: Optional[float] = None
         self.last_ram: Optional[float] = None
-        self.last_disk: Optional[float] = None
+        self.last_disk_r: Optional[float] = None
+        self.last_disk_w: Optional[float] = None
         self.last_up: Optional[float] = None
         self.last_down: Optional[float] = None
 
@@ -743,14 +664,18 @@ class Overlay(QWidget):
         cpu = self.last_cpu if self.last_cpu is not None else 0.0
         gpu = self.last_gpu if self.last_gpu is not None else 0.0
         ram = self.last_ram if self.last_ram is not None else 0.0
-        disk = self.last_disk if self.last_disk is not None else 0.0
+
+        dr = self.last_disk_r if self.last_disk_r is not None else 0.0
+        dw = self.last_disk_w if self.last_disk_w is not None else 0.0
+        disk_mb_s = dr + dw
+        disk_norm = min(100.0, (disk_mb_s / 200.0) * 100.0)  # 200MB/s ~= 100%
+
         up = self.last_up if self.last_up is not None else 0.0
         down = self.last_down if self.last_down is not None else 0.0
-
         net = up + down
         net_norm = min(100.0, (net / max(1e-6, self.NET_SAT_MB_S)) * 100.0)
 
-        score = 0.26 * cpu + 0.26 * gpu + 0.22 * ram + 0.14 * disk + 0.12 * net_norm
+        score = 0.28 * cpu + 0.28 * gpu + 0.22 * ram + 0.10 * disk_norm + 0.12 * net_norm
         score = max(0.0, min(100.0, score))
         return self.phrases.get("mood", score, MOOD_BUCKETS)
 
@@ -915,6 +840,7 @@ class Overlay(QWidget):
     def _init_hotkeys(self):
         self.hk_toggle_click = QShortcut(QKeySequence("Ctrl+Alt+T"), self)
         self.hk_toggle_click.activated.connect(self.toggle_click_through)
+
         self.hk_toggle_show = QShortcut(QKeySequence("Ctrl+Alt+H"), self)
         self.hk_toggle_show.activated.connect(self.toggle_visible)
 
@@ -951,6 +877,7 @@ class Overlay(QWidget):
         self.opacity_pct = clamp(int(v), 30, 95)
         self.apply_theme()
 
+    # ---------- refresh ----------
     def refresh(self):
         lhm = self.lhm.read()
         psu = self.psr.read()
@@ -971,7 +898,7 @@ class Overlay(QWidget):
             except Exception:
                 ram_usage = None
 
-        disk_usage = self.disk_active.read()  # ✅ PDH or fallback
+        disk_r, disk_w = self.disk_rate.read()
 
         up = psu.get("net_up_mb_s")
         down = psu.get("net_down_mb_s")
@@ -979,19 +906,26 @@ class Overlay(QWidget):
         self.last_cpu = cpu_usage
         self.last_gpu = gpu_usage
         self.last_ram = ram_usage
-        self.last_disk = disk_usage
+        self.last_disk_r = disk_r
+        self.last_disk_w = disk_w
         self.last_up = up
         self.last_down = down
 
         cpu_txt = self.phrases.get("cpu", cpu_usage, CPU_BUCKETS)
         gpu_txt = self.phrases.get("gpu", gpu_usage, GPU_BUCKETS)
         ram_txt = self.phrases.get("ram", ram_usage, RAM_BUCKETS)
-        disk_txt = self.phrases.get("disk", disk_usage, DISK_BUCKETS)
+
+        # ✅ DISK 趣味文案（跨档稳定）：基于读写合计 MB/s
+        disk_total = None if (disk_r is None or disk_w is None) else float(disk_r + disk_w)
+        disk_txt = self.phrases.get("disk_io", disk_total, DISK_IO_BUCKETS)
+
+        # ✅ DISK：超短读/写速度（MB/s），读/写
+        disk_str = f"{fmt_rate_short(disk_r)}/{fmt_rate_short(disk_w)}"
 
         line1 = f"CPU   {fmt_pct(cpu_usage)}  {cpu_txt}"
         line2 = f"GPU   {fmt_pct(gpu_usage)}  {gpu_txt}"
         line3 = f"RAM   {fmt_pct(ram_usage)}  {ram_txt}"
-        line4 = f"DISK  {fmt_pct(disk_usage)}  {disk_txt}"
+        line4 = f"DISK  {disk_str}  {disk_txt}"
         line5 = f"网络  ↑{fmt_rate_mb_s(up)}  ↓{fmt_rate_mb_s(down)}"
 
         if not self._is_effectively_collapsed():
